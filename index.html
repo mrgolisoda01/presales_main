@@ -2007,163 +2007,463 @@ boot();
 </script>
 <script>
 /* ============================================================================
-   SAFC Tracker — Supabase cloud sync (append-only add-on)
+   SAFC Tracker — Supabase cloud sync v2 (append-only add-on)
    --------------------------------------------------------------------------
-   This block is added AFTER the app's own script. It does NOT modify any of
-   the app's existing code. It only WRAPS two global functions (persist, boot)
-   from the outside so the same data the app already stores in IndexedDB is
-   mirrored to a Supabase key/value table (public.app_state), and pulled back
-   on a fresh device.
+   Added AFTER the app's own script. Does NOT modify any existing app code.
+   It wraps persist() from the outside and syncs to Supabase.
 
-   Table (already provisioned):
-     public.app_state ( key text primary key, value jsonb, updated_at timestamptz )
-     RLS: anon SELECT / INSERT / UPDATE allowed.
+   v2 fixes the v1 failure at real data volume:
+     - v1 pushed all six keys as ONE json body (~2 MB for one day) -> HTTP 413,
+       and the error was swallowed, so nothing saved while the UI looked fine.
+     - v2 stores ONE ROW PER BATCH in public.batches, gzip-compressed
+       (~12% of raw size), and pushes each batch separately.
+     - Small settings keys still go to public.app_state.
+     - Failures are now VISIBLE: on-screen toast + a badge + window.sbStatus().
 
-   Sync model: last-write-wins per key. Keys mirrored are exactly the six the
-   app persists: batches, meta, cfg, master, manual, overrides.
+   Tables:
+     public.app_state ( key text pk, value jsonb, updated_at )
+     public.batches   ( id text pk, batch_date date, type text, name text,
+                        uploaded_at bigint, row_count int, rows_gz text, updated_at )
    ========================================================================== */
 (function(){
   "use strict";
 
   var SB_URL  = "https://cqzsdflpmtttaanhetty.supabase.co/rest/v1/";
   var SB_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNxenNkZmxwbXR0dGFhbmhldHR5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQyNzE3NjQsImV4cCI6MjA5OTg0Nzc2NH0.dMqoHALVmoV24-fiu_w8-p-OCc8ZXt5nqk0dfBWDCUc";
-  var TABLE   = "app_state";
-  var KEYS    = ["batches","meta","cfg","master","manual","overrides"];
-  var PUSH_DEBOUNCE_MS = 1200;
 
-  // ---- tiny helpers ---------------------------------------------------------
+  var SMALL_KEYS = ["meta","cfg","master","manual","overrides"];  // batches handled separately
+  var PUSH_DEBOUNCE_MS = 1500;
+
+  var STATE = { lastPush:null, lastPull:null, pushed:0, failed:0, errors:[], busy:false };
+  window.sbStatus = function(){ return JSON.parse(JSON.stringify(STATE)); };
+
   function headers(extra){
     var h = { "apikey": SB_ANON, "Authorization": "Bearer " + SB_ANON, "Content-Type": "application/json" };
     if (extra) for (var k in extra) h[k] = extra[k];
     return h;
   }
-  function say(msg){ try { if (typeof toast === "function") toast(msg); } catch(_){} }
-  function redraw(){ try { if (typeof render === "function") render(); } catch(_){} }
+  function say(m){ try { if (typeof toast==="function") toast(m); } catch(_){} }
+  function redraw(){ try { if (typeof render==="function") render(); } catch(_){} }
 
-  // Is the current CACHE effectively "empty" (only seed / nothing real)?
-  function cacheIsEmpty(){
-    try {
-      var b = (typeof CACHE!=="undefined" && CACHE.batches) ? CACHE.batches : [];
-      var realBatch = b.some(function(x){ return x && !String(x.id||"").startsWith("seed"); });
-      var manual = (typeof CACHE!=="undefined" && CACHE.manual) ? CACHE.manual : {};
-      var master = (typeof CACHE!=="undefined" && CACHE.master && CACHE.master.districts) ? CACHE.master.districts : {};
-      return !realBatch && Object.keys(manual).length===0 && Object.keys(master).length===0;
-    } catch(_) { return false; }
+  function noteError(where, msg){
+    STATE.failed++;
+    STATE.errors.unshift({ at:new Date().toISOString(), where:where, msg:String(msg).slice(0,300) });
+    STATE.errors = STATE.errors.slice(0,10);
+    console.error("[cloud sync] " + where + ": " + msg);
+    badge("Cloud sync FAILED \u2014 " + where, true);
   }
 
-  // ---- PULL: read all six keys from Supabase --------------------------------
-  function pullAll(){
-    var url = SB_URL + TABLE + "?select=key,value&key=in.(" + KEYS.join(",") + ")";
-    return fetch(url, { headers: headers({ "Accept":"application/json" }) })
-      .then(function(r){ if(!r.ok) throw new Error("pull HTTP "+r.status); return r.json(); })
-      .then(function(rows){
-        var map = {};
-        (rows||[]).forEach(function(row){ if(row && row.key!=null) map[row.key] = row.value; });
-        return map;
+  // ---- small on-screen badge so sync state is never invisible ---------------
+  var badgeEl = null;
+  function badge(text, bad){
+    try{
+      if(!badgeEl){
+        badgeEl = document.createElement("div");
+        badgeEl.style.cssText = "position:fixed;right:12px;bottom:12px;z-index:99999;font:12px/1.35 ui-sans-serif,system-ui,sans-serif;"+
+          "padding:7px 11px;border-radius:8px;max-width:320px;box-shadow:0 2px 10px rgba(0,0,0,.18);cursor:pointer";
+        badgeEl.title = "Click for sync details";
+        badgeEl.addEventListener("click", function(){
+          var s = window.sbStatus();
+          alert("Cloud sync\n\nLast push: "+(s.lastPush||"never")+
+                "\nLast pull: "+(s.lastPull||"never")+
+                "\nBatches pushed: "+s.pushed+"\nFailures: "+s.failed+
+                (s.errors.length ? "\n\nRecent errors:\n"+s.errors.map(function(e){return "\u2022 "+e.where+": "+e.msg;}).join("\n") : ""));
+        });
+        document.body.appendChild(badgeEl);
+      }
+      badgeEl.textContent = text;
+      badgeEl.style.background = bad ? "#fdecec" : "#e8f5ee";
+      badgeEl.style.color      = bad ? "#8c1d1d" : "#14624a";
+      badgeEl.style.border     = "1px solid " + (bad ? "#f0b4b4" : "#a9d9c3");
+    }catch(_){}
+  }
+
+  // ---- gzip helpers (CompressionStream, with graceful fallback) -------------
+  function hasCS(){ return typeof CompressionStream === "function"; }
+
+  function gzipToB64(str){
+    if(!hasCS()) return Promise.resolve(null);
+    try{
+      var blob = new Blob([str]).stream().pipeThrough(new CompressionStream("gzip"));
+      return new Response(blob).arrayBuffer().then(function(buf){
+        var bytes = new Uint8Array(buf), bin = "", CH = 0x8000;
+        for (var i=0;i<bytes.length;i+=CH) bin += String.fromCharCode.apply(null, bytes.subarray(i,i+CH));
+        return btoa(bin);
       });
+    }catch(e){ return Promise.resolve(null); }
   }
 
-  // ---- PUSH: upsert the six keys back to Supabase ---------------------------
-  function currentSnapshot(){
-    var snap = {};
-    try {
-      snap.batches   = (CACHE.batches)   || [];
-      snap.meta      = (CACHE.meta)      || {};
-      snap.cfg       = (CACHE.cfg)       || {};
-      snap.master    = (CACHE.master)    || {};
-      snap.manual    = (CACHE.manual)    || {};
-      snap.overrides = (CACHE.overrides) || {};
-    } catch(_){}
-    return snap;
+  function b64ToGunzip(b64){
+    if(!hasCS()) return Promise.resolve(null);
+    try{
+      var bin = atob(b64), bytes = new Uint8Array(bin.length);
+      for (var i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
+      var st = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+      return new Response(st).text();
+    }catch(e){ return Promise.resolve(null); }
   }
 
-  function pushAll(){
-    var snap = currentSnapshot();
-    var payload = KEYS.map(function(k){ return { key:k, value: snap[k], updated_at: new Date().toISOString() }; });
-    var url = SB_URL + TABLE + "?on_conflict=key";
-    return fetch(url, {
-      method: "POST",
-      headers: headers({ "Prefer": "resolution=merge-duplicates,return=minimal" }),
+  // ---- PUSH ----------------------------------------------------------------
+  function pushSmallKeys(){
+    var payload = SMALL_KEYS.map(function(k){
+      var v; try { v = CACHE[k]; } catch(_){ v = null; }
+      return { key:k, value: (v===undefined?null:v), updated_at:new Date().toISOString() };
+    });
+    return fetch(SB_URL + "app_state?on_conflict=key", {
+      method:"POST",
+      headers: headers({ "Prefer":"resolution=merge-duplicates,return=minimal" }),
       body: JSON.stringify(payload)
     }).then(function(r){
-      if(!r.ok) return r.text().then(function(t){ throw new Error("push HTTP "+r.status+" "+t); });
-      return true;
+      if(!r.ok) return r.text().then(function(t){ throw new Error("HTTP "+r.status+" "+t.slice(0,160)); });
     });
   }
 
-  var pushTimer = null, pushedOnce = false;
-  function schedulePush(){
-    if (pushTimer) clearTimeout(pushTimer);
-    pushTimer = setTimeout(function(){
-      pushTimer = null;
-      pushAll().then(function(){
-        if(!pushedOnce){ pushedOnce = true; say("Synced to cloud \u2601"); }
-      }).catch(function(e){ /* offline / transient — silent, will retry on next persist */ });
-    }, PUSH_DEBOUNCE_MS);
+  function pushOneBatch(b){
+    var rows = b.rows || [];
+    return gzipToB64(JSON.stringify(rows)).then(function(gz){
+      if(gz === null) throw new Error("gzip unsupported in this browser");
+      var rec = {
+        id: String(b.id), batch_date: b.date, type: b.type, name: b.name || null,
+        uploaded_at: b.uploadedAt || null, row_count: rows.length,
+        rows_gz: gz, updated_at: new Date().toISOString()
+      };
+      return fetch(SB_URL + "batches?on_conflict=id", {
+        method:"POST",
+        headers: headers({ "Prefer":"resolution=merge-duplicates,return=minimal" }),
+        body: JSON.stringify([rec])
+      }).then(function(r){
+        if(!r.ok) return r.text().then(function(t){ throw new Error("HTTP "+r.status+" "+t.slice(0,160)); });
+        return rows.length;
+      });
+    });
   }
 
-  // ---- WRAP persist(): keep original behavior, then also push ---------------
-  if (typeof window.persist === "function") {
-    var _origPersist = window.persist;
+  function pushAll(){
+    if(STATE.busy) return Promise.resolve();
+    STATE.busy = true;
+    var batches = [];
+    try { batches = (CACHE.batches||[]).filter(function(b){ return b && !String(b.id||"").startsWith("seed"); }); } catch(_){}
+    badge("Syncing to cloud\u2026");
+
+    return pushSmallKeys().then(function(){
+      // push batches one at a time (sequential = small bodies, no burst)
+      return batches.reduce(function(chain, b){
+        return chain.then(function(){
+          return pushOneBatch(b).then(function(n){ STATE.pushed++; });
+        });
+      }, Promise.resolve());
+    }).then(function(){
+      STATE.lastPush = new Date().toLocaleString();
+      badge("\u2713 Synced to cloud \u00b7 " + batches.length + " file(s)");
+    }).catch(function(e){
+      noteError("push", e.message || e);
+      say("Cloud sync failed \u2014 " + (e.message||e));
+    }).then(function(){ STATE.busy = false; });
+  }
+
+  var t=null;
+  function schedulePush(){ if(t) clearTimeout(t); t=setTimeout(function(){ t=null; pushAll(); }, PUSH_DEBOUNCE_MS); }
+
+  // ---- PULL ----------------------------------------------------------------
+  function pullSmallKeys(){
+    return fetch(SB_URL + "app_state?select=key,value", { headers: headers({Accept:"application/json"}) })
+      .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
+      .then(function(rows){ var m={}; (rows||[]).forEach(function(x){ if(x&&x.key!=null) m[x.key]=x.value; }); return m; });
+  }
+
+  function pullBatches(){
+    // metadata first (cheap), then each batch's compressed rows
+    return fetch(SB_URL + "batches?select=id,batch_date,type,name,uploaded_at,row_count,rows_gz&order=batch_date.desc",
+                 { headers: headers({Accept:"application/json"}) })
+      .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
+      .then(function(recs){
+        return (recs||[]).reduce(function(chain, rec){
+          return chain.then(function(acc){
+            return b64ToGunzip(rec.rows_gz||"").then(function(txt){
+              var rows = [];
+              try { rows = txt ? JSON.parse(txt) : []; } catch(_){ rows = []; }
+              acc.push({ id:rec.id, date:rec.batch_date, type:rec.type, name:rec.name,
+                         uploadedAt:rec.uploaded_at, rows:rows });
+              return acc;
+            });
+          });
+        }, Promise.resolve([]));
+      });
+  }
+
+  function cacheIsEmpty(){
+    try{
+      var b = (CACHE.batches)||[];
+      var real = b.some(function(x){ return x && !String(x.id||"").startsWith("seed"); });
+      var man  = (CACHE.manual)||{}, mas = (CACHE.master&&CACHE.master.districts)||{};
+      return !real && Object.keys(man).length===0 && Object.keys(mas).length===0;
+    }catch(_){ return false; }
+  }
+
+  function pullDown(){
+    badge("Checking cloud\u2026");
+    return Promise.all([pullSmallKeys(), pullBatches()]).then(function(r){
+      var small = r[0], batches = r[1];
+      if(!batches.length){ badge("Cloud empty \u00b7 nothing to load"); return 0; }
+      SMALL_KEYS.forEach(function(k){ if(small[k]!==undefined && small[k]!==null) { try{ CACHE[k]=small[k]; }catch(_){} } });
+      try { CACHE.batches = batches; } catch(_){}
+      try { if(typeof rebuild==="function") rebuild(); } catch(_){}
+      try { if(typeof persist==="function") persist(); } catch(_){}   // save locally (also re-schedules a push; harmless)
+      redraw();
+      STATE.lastPull = new Date().toLocaleString();
+      var n = batches.reduce(function(s,b){ return s + (b.rows?b.rows.length:0); },0);
+      badge("\u2713 Loaded from cloud \u00b7 " + batches.length + " file(s)");
+      say("Loaded from cloud \u2014 " + n.toLocaleString() + " rows");
+      return batches.length;
+    }).catch(function(e){
+      noteError("pull", e.message || e);
+      return 0;
+    });
+  }
+
+  // ---- wrap persist() ------------------------------------------------------
+  if (typeof window.persist === "function"){
+    var _p = window.persist;
     window.persist = function(){
-      var r = _origPersist.apply(this, arguments);   // original IndexedDB writes, untouched
+      var r = _p.apply(this, arguments);
       try { schedulePush(); } catch(_){}
       return r;
     };
   }
 
-  // ---- Load a cloud snapshot straight into CACHE (authoritative) -----------
-  // Writes pulled values directly into the app's CACHE object, then asks the
-  // app to rebuild + redraw, and persists so IndexedDB catches up. This avoids
-  // re-running boot() (which would re-apply SEED) and sidesteps any race.
-  function applyCloudToCache(map){
-    var applied = 0;
-    KEYS.forEach(function(k){
-      var v = map[k];
-      if (v === undefined || v === null) return;
-      try { CACHE[k] = v; applied++; } catch(_){}
-    });
-    try { if (typeof rebuild === "function") rebuild(); } catch(_){}
-    try { if (typeof persist === "function") persist(); } catch(_){}  // note: this schedules a push too (harmless — same data)
-    redraw();
-    return applied;
-  }
-
-  function cloudHasData(map){
-    if (Array.isArray(map.batches) && map.batches.some(function(x){ return x && !String(x.id||"").startsWith("seed"); })) return true;
-    if (map.manual && Object.keys(map.manual).length>0) return true;
-    if (map.master && map.master.districts && Object.keys(map.master.districts).length>0) return true;
-    return false;
-  }
-
-  // ---- Post-boot sync: runs AFTER the app's own boot() has settled ----------
-  // The app's inline boot() is async (reads IndexedDB, may apply SEED, renders).
-  // We let it finish, then reconcile with the cloud once, last-write-wins:
-  //   - if this browser already has real data  -> push it up
-  //   - else if the cloud has data             -> pull it down into CACHE
-  //   - else (both empty)                      -> leave the seed state as-is
+  // ---- reconcile once after the app's own boot() has settled ---------------
   function syncOnce(){
-    if (cacheIsEmpty()) {
-      pullAll().then(function(map){
-        if (cloudHasData(map)) {
-          var n = applyCloudToCache(map);
-          say("Loaded from cloud \u2601");
-        }
-        // else: nothing anywhere yet — first-ever run, nothing to do.
-      }).catch(function(){ /* offline — keep local, will sync on next persist */ });
-    } else {
-      // Local already has real data — make sure the cloud reflects it.
-      schedulePush();
-    }
+    if(!hasCS()){ badge("Browser too old for cloud sync", true); return; }
+    if (cacheIsEmpty()) pullDown();
+    else { badge("Local data found \u00b7 syncing up\u2026"); schedulePush(); }
   }
 
-  // Give the app's boot() time to read IndexedDB and render, then reconcile.
-  // boot() resolves within a couple of IndexedDB round-trips; 600ms is safe.
-  if (document.readyState === "complete") {
-    setTimeout(syncOnce, 600);
-  } else {
-    window.addEventListener("load", function(){ setTimeout(syncOnce, 600); });
+  // manual control from the console if ever needed
+  window.sbPush = pushAll;
+  window.sbPull = pullDown;
+
+  if (document.readyState === "complete") setTimeout(syncOnce, 800);
+  else window.addEventListener("load", function(){ setTimeout(syncOnce, 800); });
+
+})();
+</script>
+
+<script>
+/* ============================================================================
+   SAFC Tracker — Dashboard drill-down (append-only add-on)
+   --------------------------------------------------------------------------
+   Added AFTER the app's own script. Does NOT modify any existing app code.
+
+   Makes every number in the Dashboard table clickable. Clicking a cell opens
+   the app's existing lead modal listing the exact leads behind that number.
+
+   It does not re-implement any metric. It re-runs the app's own engines and
+   reads the lead lists they already produce:
+     Sales / Market Visits -> milestone timestamps on CACHE.leads (same test
+                              renderDashboard uses)
+     Fresh touched         -> ggDay(fm,day).R.coverage.proof
+     Nm+ calls             -> ggDay(fm,day).R.deep.proof
+     Moves fwd             -> ggDay(fm,day).R.mover.proof
+     Fast 1st calls        -> ggDay(fm,day).R.speed.proof
+     Green pts             -> union of every ggDay rule's proof for the period
+     Red flags             -> anEngine(fm) + the AN_LAST[id] lists it fills
+
+   So the list always matches the number in the table.
+   ========================================================================== */
+(function(){
+  "use strict";
+
+  var COL_LABEL = {
+    sales:"Sales", mv:"Market Visits", fresh:"Fresh touched", deep:"Deep calls",
+    mover:"Moves fwd", fast:"Fast 1st calls", gpts:"Green pts", red:"Red flags"
+  };
+
+  function keyOf(l){ return (l && (l.key || l.phone)) || ""; }
+
+  // Collect the leads behind one FM + one metric, for the dashboard's period.
+  function leadsFor(fm, metric){
+    var out = {};                        // keyed, so duplicates collapse
+    function add(l){ if(l && keyOf(l)) out[keyOf(l)] = l; }
+
+    var p = dbPeriod(), start = p.start, end = p.end;
+
+    // ---- milestone metrics: same condition renderDashboard uses -----------
+    if (metric === "sales" || metric === "mv") {
+      var field = (metric === "sales") ? "loi" : "marketVisit";
+      for (var k in CACHE.leads){
+        var l = CACHE.leads[k];
+        if ((l.ass||"\u2014") !== fm) continue;
+        if (l.ms && l.ms[field] != null && l.ms[field] >= start && l.ms[field] < end) add(l);
+      }
+      return Object.values(out);
+    }
+
+    // ---- red flags: re-run the anomaly engine over the dashboard period ---
+    if (metric === "red") {
+      var savedAn = SEL.an;
+      SEL.an = { mode:p.mode, start:start, end:end };
+      try {
+        var A = anEngine(fm) || [];
+        A.forEach(function(a){
+          var list = (typeof AN_LAST !== "undefined" && AN_LAST) ? AN_LAST[a.id] : null;
+          (list||[]).forEach(function(l){
+            // tag which rule flagged it, for display only (non-destructive copy)
+            if (l && keyOf(l)) { out[keyOf(l)] = l; (out[keyOf(l)].__why = out[keyOf(l)].__why || []).push(a.label); }
+          });
+        });
+      } catch(_){}
+      SEL.an = savedAn;
+      return Object.values(out);
+    }
+
+    // ---- green-flag engine metrics: walk the same days renderDashboard does
+    var RULE = { fresh:"coverage", deep:"deep", mover:"mover" };
+    var days = [];
+    for (var d0 = start; d0 < end; d0 = addDays(d0,1)){
+      if (new Date(d0).getDay() === 0) continue;   // dashboard skips Sundays
+      days.push(d0);
+    }
+
+    // "Fast 1st calls" needs care: ggDay's speed.proof holds the FAILING leads
+    // when there are any (it is proof for the flag), while the dashboard column
+    // counts the leads that were called fast. So rebuild the good cohort here
+    // using the app's own speed helpers, to match the number exactly.
+    if (metric === "fast") {
+      var C = cfg();
+      days.forEach(function(d){
+        for (var k in CACHE.leads){
+          var l = CACHE.leads[k];
+          if (/^telecaller/i.test(l.ass||"")) continue;
+          if ((l.ass||"\u2014") !== fm) continue;
+          if (l.createdOn == null) continue;
+          var co;
+          try { co = speedCohortDay(l, C); } catch(_){ continue; }
+          if (!co || co.cd !== d || !co.live) continue;
+          var b;
+          try { b = classifyLive(l, C); } catch(_){ continue; }
+          if (b === "on5" || b === "in15") add(l);
+        }
+      });
+      return Object.values(out);
+    }
+
+    days.forEach(function(d){
+      var g;
+      try { g = ggDay(fm, d); } catch(_){ return; }
+      if (!g || !g.R) return;
+      if (metric === "gpts") {
+        for (var id in g.R){ (g.R[id].proof || []).forEach(add); }
+      } else {
+        var r = g.R[RULE[metric]];
+        if (r) (r.proof || []).forEach(add);
+      }
+    });
+    return Object.values(out);
   }
+
+  // ---- modal, mirroring the app's own openGgProof layout ------------------
+  function openDrill(fm, metric){
+    var items;
+    try { items = leadsFor(fm, metric); } catch(e){ items = []; }
+    var label = COL_LABEL[metric] || metric;
+    var showWhy = (metric === "red");
+
+    var head = "<tr><th>Customer</th><th>Phone</th><th>Now</th><th>District</th>" +
+               (showWhy ? "<th>Flagged for</th>" : "") + "</tr>";
+
+    var body = items.map(function(l){
+      var why = showWhy
+        ? "<td style=\"font-size:12px;color:var(--muted)\">" + esc((l.__why||[]).join(" \u00b7 ")) + "</td>"
+        : "";
+      return "<tr class=\"clk\" data-tl=\"" + esc(keyOf(l)) + "\">" +
+             "<td>" + esc(l.name || "\u2014") + "</td>" +
+             "<td class=\"num\">" + esc(l.phone || "\u2014") + "</td>" +
+             "<td>" + esc(l.status || "\u2014") + "</td>" +
+             "<td>" + esc(l.dist || "\u2014") + "</td>" + why + "</tr>";
+    }).join("");
+
+    $("#mlTitle").textContent = fm + " \u00b7 " + label +
+      (metric === "gpts"
+        ? " \u00b7 " + items.length + " lead" + (items.length===1?"":"s") + " behind the points"
+        : " (" + items.length + " lead" + (items.length===1?"":"s") + ")");
+    $("#mlBody").innerHTML = items.length
+      ? "<table><thead>" + head + "</thead><tbody>" + body + "</tbody></table>" +
+        "<div style=\"padding:10px 16px;font-size:12px;color:var(--muted)\">" +
+        periodLabelTT(dbPeriod()) +
+        (metric === "gpts"
+          ? " \u00b7 Green pts is a points total, so this lists every lead that contributed across all the green-flag rules \u2014 the lead count will not equal the points."
+          : "") +
+        " \u00b7 click any lead for its full history.</div>"
+      : "<div style=\"padding:24px;color:var(--muted)\">No leads behind this number for " +
+        periodLabelTT(dbPeriod()) + ".</div>";
+
+    $("#leadModal").classList.add("show");
+
+    // click a row -> full lead timeline, with a back link to this list
+    $("#mlBody").querySelectorAll("tr[data-tl]").forEach(function(tr){
+      tr.addEventListener("click", function(){
+        try { TL_BACK = function(){ openDrill(fm, metric); }; } catch(_){}
+        openLeadTimeline(tr.getAttribute("data-tl"));
+      });
+    });
+  }
+
+  // ---- make the dashboard cells clickable after each render ---------------
+  var COLS = ["sales","mv","fresh","deep","mover","fast","gpts","red"];
+
+  function wire(){
+    var panel = document.getElementById("dash");
+    if (!panel) return;
+    var rows = panel.querySelectorAll("tbody tr");
+    rows.forEach(function(tr){
+      var tds = tr.querySelectorAll("td");
+      if (tds.length < 3) return;                        // the "no activity" row
+      if (tr.getAttribute("data-drill") === "1") return; // already wired
+      tr.setAttribute("data-drill","1");
+
+      // layout: [rank][FM name][...8 metric cells] — metrics start at index 2
+      var fm = (tds[1].textContent || "").trim();
+      // strip the territory tag that follows the name
+      var tag = tds[1].querySelector("span");
+      if (tag) fm = (tds[1].childNodes[0].textContent || "").trim();
+
+      COLS.forEach(function(metric, i){
+        var td = tds[i+2];
+        if (!td) return;
+        var n = parseInt((td.textContent||"").replace(/[^0-9-]/g,""), 10);
+        if (!n) { td.style.opacity = "0.55"; return; }   // zero: nothing to show
+        td.classList.add("clkcell");
+        td.style.cursor = "pointer";
+        td.title = "Show the " + n + " lead" + (n===1?"":"s") + " behind " + (COL_LABEL[metric]||metric);
+        td.addEventListener("click", function(ev){
+          ev.stopPropagation();
+          openDrill(fm, metric);
+        });
+      });
+    });
+  }
+
+  // renderDashboard() rebuilds the table, so re-wire after every render.
+  if (typeof window.renderDashboard === "function") {
+    var _rd = window.renderDashboard;
+    window.renderDashboard = function(){
+      var r = _rd.apply(this, arguments);
+      try { wire(); } catch(_){}
+      return r;
+    };
+  }
+  if (typeof window.render === "function") {
+    var _r = window.render;
+    window.render = function(){
+      var r = _r.apply(this, arguments);
+      try { wire(); } catch(_){}
+      return r;
+    };
+  }
+
+  // wire whatever is already on screen
+  if (document.readyState === "complete") setTimeout(wire, 400);
+  else window.addEventListener("load", function(){ setTimeout(wire, 400); });
 
 })();
 </script>
