@@ -2468,5 +2468,250 @@ boot();
 })();
 </script>
 
+<script>
+/* ============================================================================
+   SAFC Tracker — Positive fwd / Negative fwd columns (append-only add-on)
+   --------------------------------------------------------------------------
+   Added AFTER the app's own script. Does NOT modify any existing app code.
+
+   Replaces the single "Moves fwd" dashboard column with two:
+
+     Positive fwd  -> status moves INTO: Eligible - Interested, G-Meet Scheduled,
+                      Ready To Meet, Market Visit, Future sale, LOI, Agreement, Won
+     Negative fwd  -> status moves INTO: Try 1/2/3/4 Not Connected,
+                      Request for the Call Back, Lost
+
+   Counting follows the app's own "mover" rule exactly: it counts STATUS CHANGES
+   (not distinct leads) recorded in l._changes, inside the dashboard's period,
+   using ttAdj() for the same time adjustment, and skipping Sundays like the
+   dashboard does. The only difference is the bucketing: by destination stage
+   instead of by funnel direction.
+
+   Sorting, ranking, medals, the drill-down and everything else keep working:
+   the column is rebuilt in the DOM after each render and re-sorted in place
+   when its heading is clicked.
+   ========================================================================== */
+(function(){
+  "use strict";
+
+  var POS = ['Eligible - Interested','G-Meet Scheduled','Ready To Meet',
+             'Market Visit','Future sale','LOI','Agreement','Won'];
+  var NEG = ['Try 1 Not Connected','Try 2 Not Connected','Try 3 Not Connected',
+             'Try 4 Not Connected','Request for the Call Back','Lost'];
+
+  var SORT = null;            // 'pos' | 'neg' | null (null = leave app's order)
+  var DIR  = 'desc';
+
+  function inList(list, s){ return list.indexOf(s) >= 0; }
+
+  // Count status moves for one FM over the dashboard period, split pos/neg.
+  // Mirrors ggDay's mover loop: per-day, ttAdj time, changes inside the day.
+  function movesFor(fm){
+    var p = dbPeriod(), start = p.start, end = p.end;
+    var pos = 0, neg = 0, posLeads = {}, negLeads = {};
+
+    var days = [];
+    for (var d0 = start; d0 < end; d0 = addDays(d0,1)){
+      if (new Date(d0).getDay() === 0) continue;    // dashboard skips Sundays
+      days.push(d0);
+    }
+
+    for (var k in CACHE.leads){
+      var l = CACHE.leads[k];
+      if (/^telecaller/i.test(l.ass||"")) continue;
+      if ((l.ass||"\u2014") !== fm) continue;
+      var chs = l._changes || [];
+      for (var i=0;i<chs.length;i++){
+        var ch = chs[i];
+        if (ch.at == null) continue;
+        var aT;
+        try { aT = ttAdj(ch.at); } catch(_){ aT = ch.at; }
+        // must fall inside one of the counted days
+        var hit = false;
+        for (var j=0;j<days.length;j++){
+          if (aT >= days[j] && aT < addDays(days[j],1)) { hit = true; break; }
+        }
+        if (!hit) continue;
+
+        if (inList(POS, ch.to)) { pos++; posLeads[(l.key||l.phone)] = l; }
+        else if (inList(NEG, ch.to)) { neg++; negLeads[(l.key||l.phone)] = l; }
+      }
+    }
+    return { pos:pos, neg:neg,
+             posLeads:Object.values(posLeads), negLeads:Object.values(negLeads) };
+  }
+
+  // ---- drill-down modal for the two new columns --------------------------
+  function openMoveDrill(fm, kind){
+    var m = movesFor(fm);
+    var items = (kind === "pos") ? m.posLeads : m.negLeads;
+    var n     = (kind === "pos") ? m.pos      : m.neg;
+    var label = (kind === "pos") ? "Positive fwd" : "Negative fwd";
+    var stages = (kind === "pos") ? POS : NEG;
+
+    var body = items.map(function(l){
+      return "<tr class=\"clk\" data-tl=\"" + esc(l.key||l.phone) + "\">" +
+             "<td>" + esc(l.name || "\u2014") + "</td>" +
+             "<td class=\"num\">" + esc(l.phone || "\u2014") + "</td>" +
+             "<td>" + esc(l.status || "\u2014") + "</td>" +
+             "<td>" + esc(l.dist || "\u2014") + "</td></tr>";
+    }).join("");
+
+    $("#mlTitle").textContent = fm + " \u00b7 " + label + " \u00b7 " + n + " move" +
+                                (n===1?"":"s") + " across " + items.length + " lead" +
+                                (items.length===1?"":"s");
+    $("#mlBody").innerHTML = items.length
+      ? "<table><thead><tr><th>Customer</th><th>Phone</th><th>Now</th><th>District</th></tr></thead><tbody>" +
+        body + "</tbody></table>" +
+        "<div style=\"padding:10px 16px;font-size:12px;color:var(--muted)\">" +
+        periodLabelTT(dbPeriod()) + " \u00b7 counts moves into: " + esc(stages.join(", ")) +
+        ". A lead can move more than once, so moves can exceed leads. Click a lead for its history.</div>"
+      : "<div style=\"padding:24px;color:var(--muted)\">No " + label.toLowerCase() +
+        " moves for " + periodLabelTT(dbPeriod()) + ".</div>";
+
+    $("#leadModal").classList.add("show");
+    $("#mlBody").querySelectorAll("tr[data-tl]").forEach(function(tr){
+      tr.addEventListener("click", function(){
+        try { TL_BACK = function(){ openMoveDrill(fm, kind); }; } catch(_){}
+        openLeadTimeline(tr.getAttribute("data-tl"));
+      });
+    });
+  }
+
+  // ---- rewrite the dashboard table after each render ----------------------
+  function apply(){
+    var panel = document.getElementById("dash");
+    if (!panel) return;
+    var table = panel.querySelector("table");
+    if (!table) return;
+    if (table.getAttribute("data-posneg") === "1") return;   // already done
+
+    var heads = [].slice.call(table.querySelectorAll("thead th"));
+    // find the "Moves fwd" heading
+    var mi = -1;
+    for (var i=0;i<heads.length;i++){
+      if (/moves\s*fwd/i.test(heads[i].textContent||"")) { mi = i; break; }
+    }
+    if (mi < 0) return;                                       // nothing to do
+    table.setAttribute("data-posneg","1");
+
+    // --- heading: replace one <th> with two ---
+    var thPos = document.createElement("th");
+    var thNeg = document.createElement("th");
+    thPos.className = "clkcell"; thNeg.className = "clkcell";
+    thPos.style.cursor = "pointer"; thNeg.style.cursor = "pointer";
+    thPos.textContent = "Positive fwd"; thNeg.textContent = "Negative fwd";
+    thPos.title = "Moves into: " + POS.join(", ");
+    thNeg.title = "Moves into: " + NEG.join(", ");
+    heads[mi].parentNode.replaceChild(thNeg, heads[mi]);
+    thNeg.parentNode.insertBefore(thPos, thNeg);
+
+    // --- body: replace the mover cell in every row with two cells ---
+    var rows = [].slice.call(table.querySelectorAll("tbody tr"));
+    rows.forEach(function(tr){
+      var tds = [].slice.call(tr.querySelectorAll("td"));
+      if (tds.length < mi+1) return;
+      var nameTd = tds[1];
+      if (!nameTd) return;
+      var fm = (nameTd.childNodes[0] && nameTd.childNodes[0].textContent || "").trim();
+
+      var m;
+      try { m = movesFor(fm); } catch(_){ m = {pos:0,neg:0}; }
+
+      var tdPos = document.createElement("td");
+      var tdNeg = document.createElement("td");
+      tdPos.className = "num"; tdNeg.className = "num";
+      tdPos.textContent = m.pos; tdNeg.textContent = m.neg;
+      tdPos.setAttribute("data-posval", m.pos);
+      tdNeg.setAttribute("data-negval", m.neg);
+
+      if (m.pos) {
+        tdPos.classList.add("clkcell"); tdPos.style.cursor = "pointer";
+        tdPos.style.color = "var(--teal-ink)";
+        tdPos.title = "Show the leads behind " + m.pos + " positive move" + (m.pos===1?"":"s");
+        tdPos.addEventListener("click", function(ev){ ev.stopPropagation(); openMoveDrill(fm,"pos"); });
+      } else tdPos.style.opacity = "0.55";
+
+      if (m.neg) {
+        tdNeg.classList.add("clkcell"); tdNeg.style.cursor = "pointer";
+        tdNeg.style.color = "#b23b3b";
+        tdNeg.title = "Show the leads behind " + m.neg + " negative move" + (m.neg===1?"":"s");
+        tdNeg.addEventListener("click", function(ev){ ev.stopPropagation(); openMoveDrill(fm,"neg"); });
+      } else tdNeg.style.opacity = "0.55";
+
+      var old = tds[mi];
+      old.parentNode.replaceChild(tdNeg, old);
+      tdNeg.parentNode.insertBefore(tdPos, tdNeg);
+    });
+
+    // --- sorting by the new columns (re-orders rows in place) ---
+    function sortBy(kind){
+      if (SORT === kind) DIR = (DIR === "desc") ? "asc" : "desc";
+      else { SORT = kind; DIR = "desc"; }
+      var tbody = table.querySelector("tbody");
+      var trs = [].slice.call(tbody.querySelectorAll("tr"))
+                  .filter(function(t){ return t.querySelectorAll("td").length > 2; });
+      var attr = (kind === "pos") ? "data-posval" : "data-negval";
+      trs.sort(function(a,b){
+        var av = +(a.querySelector("["+attr+"]")||{getAttribute:function(){return 0;}}).getAttribute(attr) || 0;
+        var bv = +(b.querySelector("["+attr+"]")||{getAttribute:function(){return 0;}}).getAttribute(attr) || 0;
+        return DIR === "desc" ? (bv-av) : (av-bv);
+      });
+      trs.forEach(function(t,i){
+        tbody.appendChild(t);
+        // refresh rank cell + top-row highlight
+        var first = t.querySelector("td");
+        if (first) first.innerHTML = "<b>" + (i===0?"\ud83e\udd47":i===1?"\ud83e\udd48":i===2?"\ud83e\udd49":(i+1)) + "</b>";
+        t.style.background = (i===0) ? "#FFFBEA" : "";
+      });
+      // underline the active heading
+      thPos.style.textDecoration = (SORT==="pos") ? "underline" : "";
+      thNeg.style.textDecoration = (SORT==="neg") ? "underline" : "";
+      thPos.style.color = (SORT==="pos") ? "var(--teal-ink)" : "";
+      thNeg.style.color = (SORT==="neg") ? "var(--teal-ink)" : "";
+      thPos.textContent = "Positive fwd" + (SORT==="pos" ? (DIR==="desc"?" \u2193":" \u2191") : "");
+      thNeg.textContent = "Negative fwd" + (SORT==="neg" ? (DIR==="desc"?" \u2193":" \u2191") : "");
+    }
+    thPos.addEventListener("click", function(){ sortBy("pos"); });
+    thNeg.addEventListener("click", function(){ sortBy("neg"); });
+
+    // --- extend the legend so the two columns are explained ---
+    var det = panel.querySelector("details div");
+    if (det && !det.getAttribute("data-posneg")){
+      det.setAttribute("data-posneg","1");
+      var p = document.createElement("div");
+      p.style.cssText = "margin-top:8px;padding-top:8px;border-top:1px solid var(--line)";
+      p.innerHTML = "<b>Positive fwd</b> \u2014 status moves into " + esc(POS.join(", ")) +
+                    ".<br><b>Negative fwd</b> \u2014 status moves into " + esc(NEG.join(", ")) +
+                    ".<br>Both count <i>moves</i>, not leads \u2014 one lead moving twice counts twice \u2014 " +
+                    "and both are clickable. Click either heading to re-rank by it.";
+      det.appendChild(p);
+    }
+  }
+
+  // re-apply after every dashboard render
+  if (typeof window.renderDashboard === "function"){
+    var _rd = window.renderDashboard;
+    window.renderDashboard = function(){
+      var r = _rd.apply(this, arguments);
+      try { apply(); } catch(_){}
+      return r;
+    };
+  }
+  if (typeof window.render === "function"){
+    var _r = window.render;
+    window.render = function(){
+      var r = _r.apply(this, arguments);
+      try { apply(); } catch(_){}
+      return r;
+    };
+  }
+
+  if (document.readyState === "complete") setTimeout(apply, 500);
+  else window.addEventListener("load", function(){ setTimeout(apply, 500); });
+
+})();
+</script>
+
 </body>
 </html>
