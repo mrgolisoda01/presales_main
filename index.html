@@ -2719,43 +2719,43 @@ boot();
    --------------------------------------------------------------------------
    Added AFTER the app's own script. Does NOT modify any existing app code.
 
-   Adds a "Total" row at the bottom of the Action Performed table, summing
-   every numeric column: In stage, Touched, Untouched, Stuck, Moved out,
-   Interested, Sales-push.
+   Adds a "Total" row at the bottom of the Action Performed table summing every
+   numeric column: In stage, Touched, Untouched, Stuck, Moved out, Interested,
+   Sales-push.
 
-   The totals are summed from the cells the app has already rendered, so they
-   can never disagree with the numbers on screen. The row is rebuilt after
-   every render of that panel.
+   Why a MutationObserver instead of wrapping renderAction():
+   the app's own handlers (day / week / month / FM selectors) call renderAction
+   through a reference captured inside its closure, so a wrapper on
+   window.renderAction never runs for those. Watching the panel for DOM changes
+   catches every re-render no matter who triggered it.
+
+   Totals are summed from the cells already on screen, so they can never
+   disagree with the numbers displayed.
    ========================================================================== */
 (function(){
   "use strict";
 
-  function apply(){
+  var BUSY = false;   // guard: our own insertion must not retrigger the observer
+
+  function build(){
+    if (BUSY) return;
     var panel = document.getElementById("action");
     if (!panel) return;
     var table = panel.querySelector("table");
     if (!table) return;
-
     var tbody = table.querySelector("tbody");
     if (!tbody) return;
 
-    // drop a previous total row before recomputing
-    var old = tbody.querySelector("tr[data-aptotal]");
-    if (old) old.parentNode.removeChild(old);
+    var headCells = table.querySelectorAll("thead th");
+    var ncol = headCells.length;
+    if (ncol < 2) return;
 
     var rows = [].slice.call(tbody.querySelectorAll("tr"))
                  .filter(function(tr){ return !tr.hasAttribute("data-aptotal"); });
     if (!rows.length) return;
 
-    // how many columns does the table have?
-    var headCells = table.querySelectorAll("thead th");
-    var ncol = headCells.length;
-    if (ncol < 2) return;
-
-    // sum each numeric column (skip col 0 = stage name)
     var sums = [];
     for (var c = 1; c < ncol; c++) sums[c] = 0;
-
     rows.forEach(function(tr){
       var tds = tr.querySelectorAll("td");
       for (var c = 1; c < ncol && c < tds.length; c++){
@@ -2764,52 +2764,64 @@ boot();
       }
     });
 
-    // build the row
-    var tr = document.createElement("tr");
-    tr.setAttribute("data-aptotal","1");
-    tr.style.fontWeight = "700";
-    tr.style.background = "#F6FAF8";
+    var existing = tbody.querySelector("tr[data-aptotal]");
+    var signature = sums.slice(1).join("|");
+    if (existing && existing.getAttribute("data-sig") === signature
+        && existing === tbody.lastElementChild) return;
 
-    var first = document.createElement("td");
-    first.innerHTML = "Total <span class=\"terr\" style=\"font-weight:400\">all stages</span>";
-    first.style.borderTop = "2px solid var(--line)";
-    tr.appendChild(first);
+    BUSY = true;
+    try {
+      if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
 
-    for (var c = 1; c < ncol; c++){
-      var td = document.createElement("td");
-      td.className = "num";
-      td.style.fontWeight = "700";
-      td.style.borderTop = "2px solid var(--line)";
-      td.textContent = sums[c].toLocaleString();
-      // keep the red accent the Stuck column uses
-      var head = (headCells[c] && headCells[c].textContent || "").trim().toLowerCase();
-      if (head === "stuck" && sums[c] > 0) td.classList.add("apred");
-      tr.appendChild(td);
+      var tr = document.createElement("tr");
+      tr.setAttribute("data-aptotal","1");
+      tr.setAttribute("data-sig", signature);
+      tr.style.fontWeight = "700";
+      tr.style.background = "#F6FAF8";
+
+      var first = document.createElement("td");
+      first.innerHTML = "Total <span class=\"terr\" style=\"font-weight:400\">all stages</span>";
+      first.style.borderTop = "2px solid var(--line)";
+      tr.appendChild(first);
+
+      for (var c2 = 1; c2 < ncol; c2++){
+        var td = document.createElement("td");
+        td.className = "num";
+        td.style.fontWeight = "700";
+        td.style.borderTop = "2px solid var(--line)";
+        td.textContent = sums[c2].toLocaleString();
+        var head = (headCells[c2] && headCells[c2].textContent || "").trim().toLowerCase();
+        if (head === "stuck" && sums[c2] > 0) td.classList.add("apred");
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    } finally {
+      setTimeout(function(){ BUSY = false; }, 0);
     }
-
-    tbody.appendChild(tr);
   }
 
-  // re-apply after every render of the panel
-  if (typeof window.renderAction === "function"){
-    var _ra = window.renderAction;
-    window.renderAction = function(){
-      var r = _ra.apply(this, arguments);
-      try { apply(); } catch(_){}
-      return r;
-    };
-  }
-  if (typeof window.render === "function"){
-    var _r = window.render;
-    window.render = function(){
-      var r = _r.apply(this, arguments);
-      try { apply(); } catch(_){}
-      return r;
-    };
+  function start(){
+    var panel = document.getElementById("action");
+    if (!panel) { setTimeout(start, 400); return; }
+
+    build();
+
+    try {
+      var mo = new MutationObserver(function(){
+        if (BUSY) return;
+        build();
+      });
+      mo.observe(panel, { childList:true, subtree:true });
+    } catch(_){}
+
+    document.addEventListener("click", function(ev){
+      var nav = ev.target && ev.target.closest && ev.target.closest(".snav");
+      if (nav) setTimeout(build, 250);
+    }, true);
   }
 
-  if (document.readyState === "complete") setTimeout(apply, 500);
-  else window.addEventListener("load", function(){ setTimeout(apply, 500); });
+  if (document.readyState === "complete") setTimeout(start, 600);
+  else window.addEventListener("load", function(){ setTimeout(start, 600); });
 
 })();
 </script>
