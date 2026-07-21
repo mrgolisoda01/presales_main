@@ -3074,5 +3074,113 @@ boot();
 })();
 </script>
 
+<script>
+/* ============================================================================
+   SAFC Tracker — "back to list" fix for Action Performed (append-only add-on)
+   --------------------------------------------------------------------------
+   Added AFTER the app's own script. Does NOT modify any existing app code.
+
+   Problem: the Action Performed lead lists open a lead's timeline with
+       tr.addEventListener('click', () => openLeadTimeline(tr.dataset.tl))
+   without setting TL_BACK first. openLeadTimeline only renders the
+   "back to list" link when TL_BACK is truthy, so the link is missing.
+
+   It LOOKED like it worked in Chrome only because TL_BACK is a global that is
+   never cleared — a value left over from some earlier modal in that session
+   made the link appear (and it would have sent you back to the wrong list).
+   In a fresh session (the Firefox PC) TL_BACK is null, so no link at all.
+
+   Fix: wrap the three Action Performed list openers so each records how it was
+   called, then re-bind the row clicks to set TL_BACK to a function that
+   reopens exactly that list. Same behaviour in every browser, and the link now
+   returns to the correct list instead of a stale one.
+   ========================================================================== */
+(function(){
+  "use strict";
+
+  // Re-bind the rows of the currently open modal so each click sets TL_BACK.
+  function rebind(reopen){
+    var body = document.getElementById("mlBody");
+    if (!body) return;
+    body.querySelectorAll("tr[data-tl]").forEach(function(tr){
+      if (tr.getAttribute("data-bk") === "1") return;
+      tr.setAttribute("data-bk","1");
+      tr.addEventListener("click", function(){
+        try { TL_BACK = reopen; } catch(_){}
+      }, true);   // capture phase: runs before the app's own handler
+    });
+  }
+
+  // ---- apLeadListModal(title, list, stage, start, end) --------------------
+  if (typeof window.apLeadListModal === "function"){
+    var _alm = window.apLeadListModal;
+    window.apLeadListModal = function(title, list, stage, start, end){
+      var r = _alm.apply(this, arguments);
+      var args = [title, list, stage, start, end];
+      try {
+        rebind(function(){ window.apLeadListModal.apply(null, args); });
+      } catch(_){}
+      return r;
+    };
+  }
+
+  // ---- openActionLeads(fm, stage, metric) --------------------------------
+  // This is what the Action Performed table cells call. Wrapping it as well
+  // means the back link reopens the list by its original query, which is more
+  // robust than replaying a captured array.
+  if (typeof window.openActionLeads === "function"){
+    var _oal = window.openActionLeads;
+    window.openActionLeads = function(fm, stage, metric){
+      var r = _oal.apply(this, arguments);
+      try {
+        rebind(function(){ window.openActionLeads(fm, stage, metric); });
+      } catch(_){}
+      return r;
+    };
+  }
+
+  // ---- openApMovedOut(fm, stage, sub) ------------------------------------
+  if (typeof window.openApMovedOut === "function"){
+    var _omo = window.openApMovedOut;
+    window.openApMovedOut = function(fm, stage, sub){
+      var r = _omo.apply(this, arguments);
+      try {
+        rebind(function(){ window.openApMovedOut(fm, stage, sub); });
+      } catch(_){}
+      return r;
+    };
+  }
+
+  // ---- openApReminders(fm, kind) -----------------------------------------
+  if (typeof window.openApReminders === "function"){
+    var _oar = window.openApReminders;
+    window.openApReminders = function(fm, kind){
+      var r = _oar.apply(this, arguments);
+      try {
+        rebind(function(){ window.openApReminders(fm, kind); });
+      } catch(_){}
+      return r;
+    };
+  }
+
+  // Safety net: if a lead timeline is open and somehow has no back link while
+  // TL_BACK is set, nothing to do — the app renders it. But if TL_BACK is a
+  // stale non-function object left from an old session, clear it when the
+  // modal is closed so a wrong link never appears.
+  document.addEventListener("click", function(ev){
+    var t = ev.target;
+    if (t && (t.id === "mlClose" || (t.className && String(t.className).indexOf("modal") > -1))){
+      setTimeout(function(){
+        try {
+          var modal = document.getElementById("leadModal");
+          if (modal && modal.className.indexOf("show") === -1) TL_BACK = null;
+        } catch(_){}
+      }, 50);
+    }
+  }, true);
+
+})();
+</script>
+
 </body>
 </html>
