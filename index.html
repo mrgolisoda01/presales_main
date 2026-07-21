@@ -2166,7 +2166,11 @@ boot();
 
   // ---- PULL ----------------------------------------------------------------
   function pullSmallKeys(){
-    return fetch(SB_URL + "app_state?select=key,value", { headers: headers({Accept:"application/json"}) })
+    // explicitly restrict to the settings keys — never fetch a 'batches' row,
+    // so a leftover blob from an older version can't overwrite real data
+    var only = SMALL_KEYS.filter(function(k){ return k !== "batches"; });
+    return fetch(SB_URL + "app_state?select=key,value&key=in.(" + only.join(",") + ")",
+                 { headers: headers({Accept:"application/json"}) })
       .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
       .then(function(rows){ var m={}; (rows||[]).forEach(function(x){ if(x&&x.key!=null) m[x.key]=x.value; }); return m; });
   }
@@ -2200,21 +2204,61 @@ boot();
     }catch(_){ return false; }
   }
 
+  // ---- MERGE cloud batches with whatever this browser has -----------------
+  // Union by batch id. When both sides have the same id, the newer uploadedAt
+  // wins. Days only this browser has are kept (and pushed up afterwards), days
+  // only the cloud has are added. Nobody's upload can erase anybody else's.
+  function mergeBatches(cloud){
+    var byId = {}, localOnly = 0, fromCloud = 0;
+
+    var local = [];
+    try { local = (CACHE.batches||[]).filter(function(b){ return b && !String(b.id||"").startsWith("seed"); }); } catch(_){}
+
+    local.forEach(function(b){ if(b && b.id) byId[b.id] = b; });
+
+    (cloud||[]).forEach(function(b){
+      if(!b || !b.id) return;
+      var mine = byId[b.id];
+      if(!mine){ byId[b.id] = b; fromCloud++; return; }
+      var mineAt = +(mine.uploadedAt||0), theirsAt = +(b.uploadedAt||0);
+      if (theirsAt > mineAt) { byId[b.id] = b; fromCloud++; }
+    });
+
+    var cloudIds = {};
+    (cloud||[]).forEach(function(b){ if(b&&b.id) cloudIds[b.id]=1; });
+    local.forEach(function(b){ if(b&&b.id&&!cloudIds[b.id]) localOnly++; });
+
+    return { list: Object.keys(byId).map(function(k){ return byId[k]; }),
+             fromCloud: fromCloud, localOnly: localOnly };
+  }
+
   function pullDown(){
     badge("Checking cloud\u2026");
     return Promise.all([pullSmallKeys(), pullBatches()]).then(function(r){
-      var small = r[0], batches = r[1];
-      if(!batches.length){ badge("Cloud empty \u00b7 nothing to load"); return 0; }
-      SMALL_KEYS.forEach(function(k){ if(small[k]!==undefined && small[k]!==null) { try{ CACHE[k]=small[k]; }catch(_){} } });
-      try { CACHE.batches = batches; } catch(_){}
+      var small = r[0], cloudBatches = r[1];
+
+      // small keys: only ever the five settings keys, never 'batches'
+      SMALL_KEYS.forEach(function(k){
+        if(k === "batches") return;                       // guard: batches never come from app_state
+        if(small[k]!==undefined && small[k]!==null){ try{ CACHE[k]=small[k]; }catch(_){} }
+      });
+
+      var m = mergeBatches(cloudBatches);
+      if(!m.list.length){ badge("Cloud empty \u00b7 nothing to load"); return 0; }
+
+      try { CACHE.batches = m.list; } catch(_){}
       try { if(typeof rebuild==="function") rebuild(); } catch(_){}
-      try { if(typeof persist==="function") persist(); } catch(_){}   // save locally (also re-schedules a push; harmless)
+      try { if(typeof persist==="function") persist(); } catch(_){}
       redraw();
+
       STATE.lastPull = new Date().toLocaleString();
-      var n = batches.reduce(function(s,b){ return s + (b.rows?b.rows.length:0); },0);
-      badge("\u2713 Loaded from cloud \u00b7 " + batches.length + " file(s)");
-      say("Loaded from cloud \u2014 " + n.toLocaleString() + " rows");
-      return batches.length;
+      var n = m.list.reduce(function(s,b){ return s + (b.rows?b.rows.length:0); },0);
+      badge("\u2713 In sync \u00b7 " + m.list.length + " file(s)");
+      if (m.fromCloud) say("Loaded " + m.fromCloud + " new file(s) from cloud \u2014 " + n.toLocaleString() + " rows");
+
+      // anything only this browser had goes up so others get it too
+      if (m.localOnly) schedulePush();
+      return m.list.length;
     }).catch(function(e){
       noteError("pull", e.message || e);
       return 0;
@@ -2232,11 +2276,26 @@ boot();
   }
 
   // ---- reconcile once after the app's own boot() has settled ---------------
+  // Always pull-and-merge, whether or not this browser already has data. The
+  // old behaviour (push if local data exists, else pull) meant anyone who had
+  // ever loaded a file stopped receiving other people's uploads entirely.
   function syncOnce(){
     if(!hasCS()){ badge("Browser too old for cloud sync", true); return; }
-    if (cacheIsEmpty()) pullDown();
-    else { badge("Local data found \u00b7 syncing up\u2026"); schedulePush(); }
+    pullDown();
   }
+
+  // Keep an open tab current: re-check the cloud periodically and when the tab
+  // regains focus, so a colleague's upload appears without a manual refresh.
+  var REFRESH_MS = 3 * 60 * 1000;
+  setInterval(function(){
+    if (document.hidden) return;
+    if (STATE.busy) return;
+    pullDown();
+  }, REFRESH_MS);
+
+  document.addEventListener("visibilitychange", function(){
+    if (!document.hidden && !STATE.busy) pullDown();
+  });
 
   // manual control from the console if ever needed
   window.sbPush = pushAll;
@@ -2818,158 +2877,6 @@ boot();
       var nav = ev.target && ev.target.closest && ev.target.closest(".snav");
       if (nav) setTimeout(build, 250);
     }, true);
-  }
-
-  if (document.readyState === "complete") setTimeout(start, 600);
-  else window.addEventListener("load", function(){ setTimeout(start, 600); });
-
-})();
-</script>
-
-<script>
-/* ============================================================================
-   SAFC Tracker — copy phone without the 91 prefix (append-only add-on)
-   --------------------------------------------------------------------------
-   Added AFTER the app's own script. Does NOT modify any existing app code.
-
-   Puts a small copy icon next to every phone number shown in a lead-list
-   popup (Status Change opening / moved in / moved out / closing, and the
-   other lead lists that use the same modal). Clicking it copies the number
-   with the country code removed:  919825045910  ->  9825045910
-
-   Stripping rule (deliberately conservative):
-     - digits only; a leading '+' and any spaces / dashes are ignored
-     - 12 digits starting '91'  -> drop the 91   (919825045910 -> 9825045910)
-     - 11 digits starting '0'   -> drop the 0
-     - anything else is copied as-is
-   A genuine 10-digit number that happens to start with 91 is left alone,
-   because only 12-digit values get the prefix removed.
-
-   A MutationObserver is used rather than wrapping the modal functions: the
-   app builds these lists from several different functions, and some are
-   called from inside its own closure, so a wrapper would miss them.
-   ========================================================================== */
-(function(){
-  "use strict";
-
-  var BUSY = false;
-
-  function strip(raw){
-    var d = (""+(raw||"")).replace(/\D/g,"");
-    if (d.length === 12 && d.slice(0,2) === "91") return d.slice(2);
-    if (d.length === 11 && d.charAt(0) === "0")   return d.slice(1);
-    return d;
-  }
-
-  function flash(btn, ok){
-    var old = btn.innerHTML;
-    btn.innerHTML = ok ? "&#10003;" : "&#33;";
-    btn.style.color = ok ? "#14624a" : "#b23b3b";
-    setTimeout(function(){ btn.innerHTML = old; btn.style.color = ""; }, 900);
-  }
-
-  function copy(text, btn){
-    function done(ok){
-      flash(btn, ok);
-      try { if (ok && typeof toast === "function") toast("Copied " + text); } catch(_){}
-    }
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(function(){ done(true); }, function(){ fallback(); });
-        return;
-      }
-    } catch(_){}
-    fallback();
-
-    function fallback(){
-      try {
-        var ta = document.createElement("textarea");
-        ta.value = text;
-        ta.setAttribute("readonly","");
-        ta.style.cssText = "position:fixed;top:-1000px;left:-1000px;opacity:0";
-        document.body.appendChild(ta);
-        ta.select(); ta.setSelectionRange(0, ta.value.length);
-        var ok = document.execCommand("copy");
-        document.body.removeChild(ta);
-        done(!!ok);
-      } catch(e){ done(false); }
-    }
-  }
-
-  // Is this cell a phone-number cell? Header text decides, so we never touch
-  // other numeric columns (calls, durations, days in stage...).
-  function phoneColumns(table){
-    var idx = [];
-    var ths = table.querySelectorAll("thead th");
-    for (var i=0;i<ths.length;i++){
-      var t = (ths[i].textContent||"").trim().toLowerCase();
-      if (t === "phone" || t === "phone no" || t === "mobile" || t === "number") idx.push(i);
-    }
-    return idx;
-  }
-
-  function decorate(){
-    if (BUSY) return;
-    var body = document.getElementById("mlBody");
-    if (!body) return;
-    var tables = body.querySelectorAll("table");
-    if (!tables.length) return;
-
-    BUSY = true;
-    try {
-      [].forEach.call(tables, function(table){
-        var cols = phoneColumns(table);
-        if (!cols.length) return;
-        var rows = table.querySelectorAll("tbody tr");
-        [].forEach.call(rows, function(tr){
-          var tds = tr.querySelectorAll("td");
-          cols.forEach(function(ci){
-            var td = tds[ci];
-            if (!td || td.getAttribute("data-phcopy") === "1") return;
-
-            var raw = (td.textContent||"").trim();
-            var num = strip(raw);
-            if (!num || num.length < 6) return;      // not a phone, leave it
-
-            td.setAttribute("data-phcopy","1");
-            td.style.whiteSpace = "nowrap";
-
-            var btn = document.createElement("span");
-            btn.textContent = "\u29C9";              // copy glyph
-            btn.title = "Copy " + num + " (without 91)";
-            btn.setAttribute("role","button");
-            btn.style.cssText =
-              "display:inline-block;margin-left:7px;cursor:pointer;opacity:.55;" +
-              "font-size:13px;line-height:1;vertical-align:middle;user-select:none";
-            btn.addEventListener("mouseenter", function(){ btn.style.opacity = "1"; });
-            btn.addEventListener("mouseleave", function(){ btn.style.opacity = ".55"; });
-            btn.addEventListener("click", function(ev){
-              ev.stopPropagation();                  // don't open the lead timeline
-              ev.preventDefault();
-              copy(num, btn);
-            });
-            td.appendChild(btn);
-          });
-        });
-      });
-    } finally {
-      setTimeout(function(){ BUSY = false; }, 0);
-    }
-  }
-
-  function start(){
-    var modal = document.getElementById("leadModal");
-    var body  = document.getElementById("mlBody");
-    if (!modal || !body) { setTimeout(start, 400); return; }
-
-    decorate();
-    try {
-      var mo = new MutationObserver(function(){ if (!BUSY) decorate(); });
-      mo.observe(body, { childList:true, subtree:true });
-      // also react when the modal is opened/closed (class flip)
-      var mo2 = new MutationObserver(function(){ if (!BUSY) setTimeout(decorate, 60); });
-      mo2.observe(modal, { attributes:true, attributeFilter:["class"] });
-    } catch(_){}
   }
 
   if (document.readyState === "complete") setTimeout(start, 600);
