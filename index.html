@@ -2885,5 +2885,194 @@ boot();
 })();
 </script>
 
+<script>
+/* ============================================================================
+   SAFC Tracker — copy phone number (append-only add-on)
+   --------------------------------------------------------------------------
+   Added AFTER the app's own script. Does NOT modify any existing app code.
+
+   Adds a small "copy" button next to every phone number shown in any lead
+   modal (Action Performed, Dashboard drill-downs, Talk-Time, Buckets, etc).
+   Clicking it copies the 10-digit number WITHOUT the 91 country code.
+
+   Also adds a "Copy all" button in the modal header that copies every number
+   in the open list, one per line.
+
+   It watches the modal for changes, so it works no matter which panel opened
+   it and survives re-renders. Clicking copy never triggers the row's own
+   click-through to the lead timeline.
+   ========================================================================== */
+(function(){
+  "use strict";
+
+  var BUSY = false;
+
+  // 918056193634 -> 8056193634 ; +91 90000 00000 -> 9000000000 ; 9876543210 -> unchanged
+  function tenDigits(raw){
+    var d = String(raw||"").replace(/\D/g,"");
+    if (d.length > 10){
+      if (d.slice(0,3) === "091") d = d.slice(3);
+      else if (d.slice(0,2) === "91") d = d.slice(2);
+      else if (d.slice(0,1) === "0")  d = d.slice(1);
+    }
+    if (d.length > 10) d = d.slice(-10);      // fall back to the last 10 digits
+    return d;
+  }
+
+  function looksLikePhone(txt){
+    var d = String(txt||"").replace(/\D/g,"");
+    return d.length >= 10 && d.length <= 13;
+  }
+
+  function copyText(text){
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText){
+        return navigator.clipboard.writeText(text);
+      }
+    } catch(_){}
+    // fallback for non-secure contexts
+    return new Promise(function(res, rej){
+      try {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.cssText = "position:fixed;left:-9999px;top:0";
+        document.body.appendChild(ta);
+        ta.focus(); ta.select();
+        var ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+        ok ? res() : rej(new Error("copy blocked"));
+      } catch(e){ rej(e); }
+    });
+  }
+
+  function flash(btn, label){
+    var old = btn.textContent;
+    btn.textContent = label;
+    btn.style.color = "var(--teal-ink)";
+    setTimeout(function(){ btn.textContent = old; btn.style.color = ""; }, 1100);
+  }
+
+  function makeBtn(){
+    var b = document.createElement("button");
+    b.className = "phcopy";
+    b.type = "button";
+    b.textContent = "copy";
+    b.style.cssText =
+      "margin-left:8px;padding:1px 6px;font-size:11px;line-height:1.5;cursor:pointer;" +
+      "border:1px solid var(--line);border-radius:5px;background:#fff;color:var(--muted);" +
+      "font-family:inherit;vertical-align:middle";
+    b.addEventListener("mouseenter", function(){ b.style.background = "#F3F8F6"; });
+    b.addEventListener("mouseleave", function(){ b.style.background = "#fff"; });
+    return b;
+  }
+
+  // find which column holds phone numbers in a table
+  function phoneColIndex(table){
+    var ths = table.querySelectorAll("thead th");
+    for (var i=0;i<ths.length;i++){
+      if (/phone|mobile|number/i.test(ths[i].textContent||"")) return i;
+    }
+    return -1;
+  }
+
+  function decorate(){
+    if (BUSY) return;
+    var modal = document.getElementById("leadModal");
+    if (!modal || modal.className.indexOf("show") === -1) return;
+    var body = document.getElementById("mlBody");
+    if (!body) return;
+
+    BUSY = true;
+    try {
+      var numbers = [];
+
+      [].slice.call(body.querySelectorAll("table")).forEach(function(table){
+        var ci = phoneColIndex(table);
+        if (ci < 0) return;
+
+        [].slice.call(table.querySelectorAll("tbody tr")).forEach(function(tr){
+          var tds = tr.querySelectorAll("td");
+          var td = tds[ci];
+          if (!td) return;
+
+          // remember the number for "Copy all"
+          var raw = (td.getAttribute("data-phraw") || td.textContent || "").trim();
+          if (!looksLikePhone(raw)) return;
+          var ten = tenDigits(raw);
+          if (ten) numbers.push(ten);
+
+          if (td.querySelector(".phcopy")) return;     // already has a button
+
+          // keep the original text, stash it so re-decoration stays accurate
+          td.setAttribute("data-phraw", raw);
+
+          var btn = makeBtn();
+          btn.addEventListener("click", function(ev){
+            ev.preventDefault();
+            ev.stopPropagation();                      // don't open the timeline
+            copyText(ten).then(function(){ flash(btn,"\u2713"); })
+                         .catch(function(){ flash(btn,"\u2717"); });
+          });
+          td.appendChild(btn);
+        });
+      });
+
+      // "Copy all" in the modal header
+      var head = modal.querySelector(".modal-h");
+      if (head && numbers.length){
+        var all = head.querySelector("#phCopyAll");
+        if (!all){
+          all = document.createElement("button");
+          all.id = "phCopyAll";
+          all.className = "mini";
+          all.type = "button";
+          all.style.marginRight = "8px";
+          var closeBtn = head.querySelector("#mlClose");
+          if (closeBtn) head.insertBefore(all, closeBtn); else head.appendChild(all);
+        }
+        all.textContent = "Copy all " + numbers.length + " numbers";
+        all.onclick = function(ev){
+          ev.preventDefault(); ev.stopPropagation();
+          copyText(numbers.join("\n")).then(function(){
+            var t = all.textContent;
+            all.textContent = "\u2713 Copied " + numbers.length;
+            setTimeout(function(){ all.textContent = t; }, 1300);
+          }).catch(function(){
+            var t = all.textContent;
+            all.textContent = "\u2717 Copy blocked";
+            setTimeout(function(){ all.textContent = t; }, 1600);
+          });
+        };
+      } else if (head){
+        var stale = head.querySelector("#phCopyAll");
+        if (stale && !numbers.length && stale.parentNode) stale.parentNode.removeChild(stale);
+      }
+    } finally {
+      setTimeout(function(){ BUSY = false; }, 0);
+    }
+  }
+
+  function start(){
+    var modal = document.getElementById("leadModal");
+    if (!modal){ setTimeout(start, 500); return; }
+
+    decorate();
+
+    try {
+      var mo = new MutationObserver(function(){
+        if (BUSY) return;
+        decorate();
+      });
+      // watch both the contents and the show/hide class flip
+      mo.observe(modal, { childList:true, subtree:true, attributes:true, attributeFilter:["class"] });
+    } catch(_){}
+  }
+
+  if (document.readyState === "complete") setTimeout(start, 700);
+  else window.addEventListener("load", function(){ setTimeout(start, 700); });
+
+})();
+</script>
+
 </body>
 </html>
