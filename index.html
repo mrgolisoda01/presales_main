@@ -3182,5 +3182,235 @@ boot();
 })();
 </script>
 
+<script>
+/* ============================================================================
+   SAFC Tracker — login + per-FM scoping (append-only add-on)
+   --------------------------------------------------------------------------
+   Added AFTER the app's own script. Does NOT modify any existing app code.
+
+   - Shows a login screen over the app until a valid user signs in.
+   - Passwords are never stored. Each account holds a random 16-byte salt and a
+     PBKDF2-SHA256 hash (150,000 iterations) verified with the browser's Web
+     Crypto API.
+   - role "fm"    -> the app is scoped to that FM only: CACHE.leads is filtered
+                     at the data layer, so every panel, table, drill-down and
+                     export shows only their own leads. Upload/edit panels are
+                     hidden so nobody can overwrite shared data.
+   - role "admin" -> sees everything, exactly like the normal app.
+
+   IMPORTANT (stated plainly): this is a front-end login. It keeps honest users
+   in their own lane, but the leads are downloaded to the browser, so somebody
+   technical could inspect them with developer tools. It is a convenience
+   filter, not a security boundary.
+   ========================================================================== */
+(function(){
+  "use strict";
+
+  var ACCOUNTS = [{"u":"rajendra","s":"2a1f548ee30adaa1caf8affa07b5a064","h":"e4628ecb1dae69efefa4716e758653a7dfc66121aeb73f9ea89873f6f9db6e0f","role":"fm","fm":"Rajendra"},{"u":"ramkishore","s":"4fa63f9875c7e651b4081c806b45f2e5","h":"2e24655fb25d2ad158f567d738b3071392289060144458f93a8fd58ba68b4536","role":"fm","fm":"Ram kishore"},{"u":"sanjay","s":"e4191c825c9c89d3d8abebb842dfdc91","h":"a55bcfe8aba881790b6a5bab9e59668f722769e6a89546c911a611538286600a","role":"fm","fm":"Sanjay"},{"u":"sureshn","s":"1bbcabd3428e9ed8e697d6a9a086aa62","h":"b6fe941989f32dd7a8473e222965d9683da2e104b4c23987ea2be71e716941a7","role":"fm","fm":"Suresh N"},{"u":"jeshwanthkumar","s":"e43a08b874a6516c8c6da5acfaca473f","h":"d1d6d60644a91ba26b99d6f2c3ef690be783b45cf17ac03f54213ec7408b8b97","role":"fm","fm":"jeshwanth Kumar"},{"u":"admin","s":"2c846244d1a105d68c5158e6cffd86f8","h":"9021b29dc61ef638aca60e49cb890b77eaa706a0c25ef917b2729617c800a26c","role":"admin","fm":null}];
+  var ITER = 150000;
+  var SESSION_KEY = "safc_session_v1";
+
+  // panels an FM must not reach (upload / edit / configuration)
+  var FM_HIDDEN = ["data","setup","settings","mis","overrides"];
+
+  var ME = null;
+
+  // ---------- password hashing (Web Crypto) ----------
+  function hex(buf){
+    var b = new Uint8Array(buf), s = "";
+    for (var i=0;i<b.length;i++) s += b[i].toString(16).padStart(2,"0");
+    return s;
+  }
+  function fromHex(h){
+    var a = new Uint8Array(h.length/2);
+    for (var i=0;i<a.length;i++) a[i] = parseInt(h.substr(i*2,2),16);
+    return a;
+  }
+  function derive(password, saltHex){
+    var enc = new TextEncoder();
+    return crypto.subtle.importKey("raw", enc.encode(password), {name:"PBKDF2"}, false, ["deriveBits"])
+      .then(function(key){
+        return crypto.subtle.deriveBits(
+          { name:"PBKDF2", salt: fromHex(saltHex), iterations: ITER, hash:"SHA-256" },
+          key, 256);
+      }).then(hex);
+  }
+
+  function findAccount(u){
+    u = String(u||"").trim().toLowerCase();
+    for (var i=0;i<ACCOUNTS.length;i++) if (ACCOUNTS[i].u === u) return ACCOUNTS[i];
+    return null;
+  }
+
+  // ---------- session ----------
+  function saveSession(a){
+    try { sessionStorage.setItem(SESSION_KEY, JSON.stringify({u:a.u, role:a.role, fm:a.fm})); } catch(_){}
+  }
+  function loadSession(){
+    try {
+      var raw = sessionStorage.getItem(SESSION_KEY);
+      if (!raw) return null;
+      var s = JSON.parse(raw);
+      var a = findAccount(s.u);
+      // re-validate against the embedded list so a tampered session is useless
+      if (!a || a.role !== s.role || a.fm !== s.fm) return null;
+      return s;
+    } catch(_){ return null; }
+  }
+  function clearSession(){ try { sessionStorage.removeItem(SESSION_KEY); } catch(_){} }
+
+  // ---------- scoping ----------
+  // Filter the lead store itself. Every panel reads CACHE.leads, so scoping
+  // here means nothing is missed and no panel needs patching.
+  function applyScope(){
+    if (!ME || ME.role !== "fm" || !ME.fm) return;
+    var want = String(ME.fm).trim().toLowerCase();
+    try {
+      var src = CACHE.leads || {}, out = {};
+      for (var k in src){
+        var l = src[k];
+        if (l && String(l.ass||"").trim().toLowerCase() === want) out[k] = l;
+      }
+      CACHE.leads = out;
+    } catch(_){}
+    // pin every panel's FM selector to this FM
+    try {
+      ["fm","apfm","ttfm","whfm","ggfm","anfm","bfm","scfm","sfm"].forEach(function(k){
+        SEL[k] = ME.fm;
+      });
+    } catch(_){}
+  }
+
+  // rebuild() repopulates CACHE.leads from the batches, so re-scope after it
+  function hookRebuild(){
+    if (typeof window.rebuild !== "function") return;
+    var _rb = window.rebuild;
+    window.rebuild = function(){
+      var r = _rb.apply(this, arguments);
+      try { applyScope(); } catch(_){}
+      return r;
+    };
+  }
+
+  function hidePanelsForFM(){
+    if (!ME || ME.role !== "fm") return;
+    try {
+      FM_HIDDEN.forEach(function(p){
+        document.querySelectorAll('.snav[data-panel="'+p+'"]').forEach(function(el){
+          el.style.display = "none";
+        });
+      });
+      // if the hidden panel is currently open, go back to the dashboard
+      var active = document.querySelector(".snav.active");
+      if (active && FM_HIDDEN.indexOf(active.getAttribute("data-panel")) > -1){
+        var dash = document.querySelector('.snav[data-panel="dash"]');
+        if (dash) dash.click();
+      }
+    } catch(_){}
+  }
+
+  function stampIdentity(){
+    try {
+      var box = document.querySelector(".brand");
+      if (!box || document.getElementById("whoami")) return;
+      var d = document.createElement("div");
+      d.id = "whoami";
+      d.style.cssText = "margin-top:8px;font-size:11px;color:rgba(255,255,255,.75);line-height:1.5";
+      d.innerHTML = (ME.role === "admin" ? "Admin" : esc(ME.fm)) +
+        ' \u00b7 <a href="#" id="logoutLink" style="color:#8fd3bd">sign out</a>';
+      box.appendChild(d);
+      var lg = document.getElementById("logoutLink");
+      if (lg) lg.addEventListener("click", function(e){
+        e.preventDefault(); clearSession(); location.reload();
+      });
+    } catch(_){}
+  }
+
+  // ---------- login screen ----------
+  function showLogin(){
+    var wrap = document.createElement("div");
+    wrap.id = "loginWrap";
+    wrap.style.cssText =
+      "position:fixed;inset:0;z-index:100000;background:#0f2c26;display:flex;" +
+      "align-items:center;justify-content:center;font-family:ui-sans-serif,system-ui,sans-serif";
+    wrap.innerHTML =
+      '<div style="background:#fff;border-radius:14px;padding:30px 30px 24px;width:340px;box-shadow:0 18px 50px rgba(0,0,0,.35)">' +
+        '<div style="font-size:19px;font-weight:800;color:#0f2c26;letter-spacing:-.2px">SAFC Tracker</div>' +
+        '<div style="font-size:12px;color:#6b7f79;margin:3px 0 20px;letter-spacing:.09em;text-transform:uppercase">Mr. Goli Soda</div>' +
+        '<label style="display:block;font-size:12px;color:#425c55;margin-bottom:5px">Username</label>' +
+        '<input id="lgUser" autocomplete="username" style="width:100%;box-sizing:border-box;padding:9px 11px;border:1px solid #cfe0d9;border-radius:8px;font-size:14px;margin-bottom:13px">' +
+        '<label style="display:block;font-size:12px;color:#425c55;margin-bottom:5px">Password</label>' +
+        '<input id="lgPass" type="password" autocomplete="current-password" style="width:100%;box-sizing:border-box;padding:9px 11px;border:1px solid #cfe0d9;border-radius:8px;font-size:14px">' +
+        '<div id="lgErr" style="min-height:17px;color:#b23b3b;font-size:12px;margin:9px 0 3px"></div>' +
+        '<button id="lgGo" style="width:100%;padding:10px;border:0;border-radius:8px;background:#0f6b55;color:#fff;font-size:14px;font-weight:600;cursor:pointer">Sign in</button>' +
+      '</div>';
+    document.body.appendChild(wrap);
+
+    var user = document.getElementById("lgUser");
+    var pass = document.getElementById("lgPass");
+    var err  = document.getElementById("lgErr");
+    var go   = document.getElementById("lgGo");
+
+    function fail(m){ err.textContent = m; pass.value = ""; pass.focus(); }
+
+    function attempt(){
+      err.textContent = "";
+      var a = findAccount(user.value);
+      var pw = pass.value;
+      if (!a || !pw){ fail("Wrong username or password."); return; }
+      go.disabled = true; go.textContent = "Checking\u2026";
+      derive(pw, a.s).then(function(h){
+        go.disabled = false; go.textContent = "Sign in";
+        if (h !== a.h){ fail("Wrong username or password."); return; }
+        ME = { u:a.u, role:a.role, fm:a.fm };
+        saveSession(a);
+        wrap.parentNode.removeChild(wrap);
+        activate();
+      }).catch(function(){
+        go.disabled = false; go.textContent = "Sign in";
+        fail("Could not sign in on this browser.");
+      });
+    }
+
+    go.addEventListener("click", attempt);
+    [user,pass].forEach(function(el){
+      el.addEventListener("keydown", function(e){ if (e.key === "Enter") attempt(); });
+    });
+    setTimeout(function(){ user.focus(); }, 60);
+  }
+
+  // ---------- start ----------
+  function activate(){
+    applyScope();
+    hidePanelsForFM();
+    stampIdentity();
+    try { if (typeof render === "function") render(); } catch(_){}
+    // re-hide after any later render
+    try {
+      var mo = new MutationObserver(function(){ hidePanelsForFM(); });
+      var sb = document.querySelector(".side") || document.body;
+      mo.observe(sb, { childList:true, subtree:true });
+    } catch(_){}
+  }
+
+  function start(){
+    if (!(window.crypto && crypto.subtle)){
+      // Web Crypto needs https or localhost; Render serves https so this is fine
+      document.body.innerHTML =
+        '<div style="padding:40px;font-family:system-ui">This app must be opened over https.</div>';
+      return;
+    }
+    hookRebuild();
+    var s = loadSession();
+    if (s){ ME = s; activate(); }
+    else showLogin();
+  }
+
+  if (document.readyState === "complete") setTimeout(start, 300);
+  else window.addEventListener("load", function(){ setTimeout(start, 300); });
+
+})();
+</script>
+
 </body>
 </html>
